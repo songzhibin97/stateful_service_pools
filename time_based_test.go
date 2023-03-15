@@ -25,14 +25,14 @@ func (m mockStatefulServiceParam) String() string {
 type mockNewStatefulService struct {
 }
 
-func (m mockNewStatefulService) NewStatefulService(p StatefulServiceParam) *mockStatefulService {
+func (m mockNewStatefulService) NewStatefulService(p mockStatefulServiceParam) *mockStatefulService {
 	return &mockStatefulService{name: p.String()}
 }
 
 func TestTimeBasedStatefulServicePool(t *testing.T) {
 	service := &mockNewStatefulService{}
 
-	pool := NewTimeBasedStatefulServicePool[StatefulServiceParam, *mockStatefulService](context.Background(), service, SetTimeBasedStatefulServiceInterval(time.Second*10))
+	pool := NewTimeBasedStatefulServicePool[mockStatefulServiceParam, *mockStatefulService](context.Background(), service, SetTimeBasedStatefulServiceInterval(time.Second*10))
 
 	_, ok := pool.safeMap.Get("test1")
 	assert.Equal(t, false, ok)
