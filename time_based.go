@@ -24,36 +24,37 @@ func SetTimeBasedStatefulServiceInterval(interval time.Duration) options.Option[
 }
 
 type refreshExpiryTimeGoroutine[P StatefulServiceParam, V StatefulService] struct {
-	done            atomic.Bool
-	ctx             context.Context
-	cancel          context.CancelFunc
-	refreshInterval time.Duration
+	ctx context.Context
 
 	timeBasedStatefulService *timeBasedStatefulService[P, V]
 }
 
 func (r *refreshExpiryTimeGoroutine[P, V]) Start() {
-	if r.done.Load() {
+	if r.timeBasedStatefulService.done.Load() {
 		return
 	}
 
 	go func() {
-		timer := time.NewTicker(r.refreshInterval)
-		defer timer.Stop()
+		ticker := time.NewTicker(r.timeBasedStatefulService.config.interval)
+		defer ticker.Stop()
+		pre := time.Now()
 	loop:
-		for !r.done.Load() {
+		for !r.timeBasedStatefulService.done.Load() {
 			select {
 			case <-r.ctx.Done():
 				break loop
-			case <-timer.C:
-				now := time.Now()
-				if now.After(r.timeBasedStatefulService.expire) && atomic.LoadInt32(&r.timeBasedStatefulService.count) == 0 {
-					break loop
+			case timer := <-ticker.C:
+				if pre.After(timer) {
+					continue
 				}
-
-				// 续期
-				if now.Add(r.refreshInterval).After(r.timeBasedStatefulService.expire) {
-					r.timeBasedStatefulService.expire.Add(r.timeBasedStatefulService.config.interval)
+				break loop
+			case number := <-r.timeBasedStatefulService.event:
+				val := atomic.AddInt32(&r.timeBasedStatefulService.count, number)
+				if val <= 0 {
+					pre = time.Now()
+					ticker.Reset(r.timeBasedStatefulService.config.interval)
+				} else {
+					ticker.Stop()
 				}
 			}
 		}
@@ -68,28 +69,26 @@ func (r *refreshExpiryTimeGoroutine[P, V]) Start() {
 }
 
 func (r *refreshExpiryTimeGoroutine[P, V]) Stop() {
-	if r.done.Swap(true) {
+	if r.timeBasedStatefulService.done.Swap(true) {
 		return
 	}
-	r.cancel()
+	r.timeBasedStatefulService.cancel()
+	close(r.timeBasedStatefulService.event)
 }
 
-func newRefreshExpiryTimeGoroutine[P StatefulServiceParam, V StatefulService](ctx context.Context, timeBasedStatefulService *timeBasedStatefulService[P, V], refreshInterval time.Duration) *refreshExpiryTimeGoroutine[P, V] {
-	ctx, cancel := context.WithCancel(ctx)
+func newRefreshExpiryTimeGoroutine[P StatefulServiceParam, V StatefulService](ctx context.Context, timeBasedStatefulService *timeBasedStatefulService[P, V]) *refreshExpiryTimeGoroutine[P, V] {
 	return &refreshExpiryTimeGoroutine[P, V]{
 		ctx:                      ctx,
-		cancel:                   cancel,
-		refreshInterval:          refreshInterval,
 		timeBasedStatefulService: timeBasedStatefulService,
 	}
 }
 
 type timeBasedStatefulService[P StatefulServiceParam, V StatefulService] struct {
+	done atomic.Bool
+
 	config *timeBasedStatefulServiceConfig
 
 	count int32
-
-	expire time.Time // expire time
 
 	p P
 
@@ -98,34 +97,48 @@ type timeBasedStatefulService[P StatefulServiceParam, V StatefulService] struct 
 	pool *TimeBasedStatefulServicePool[P, V]
 
 	ctx context.Context
+
+	cancel context.CancelFunc
+
+	event chan int32
 }
 
 func (t *timeBasedStatefulService[P, V]) add() {
-	atomic.AddInt32(&t.count, 1)
+	if t.done.Load() {
+		return
+	}
+	t.event <- 1
 }
 
 func (t *timeBasedStatefulService[P, V]) sub() {
-	atomic.AddInt32(&t.count, -1)
+	if t.done.Load() {
+		return
+	}
+	t.event <- -1
 }
 
 func newTimeBasedStatefulService[P StatefulServiceParam, V StatefulService](ctx context.Context, p P, v V, pool *TimeBasedStatefulServicePool[P, V], opts ...options.Option[*timeBasedStatefulServiceConfig]) *timeBasedStatefulService[P, V] {
+	ctx, cancel := context.WithCancel(ctx)
+
 	timeBasedStatefulService := &timeBasedStatefulService[P, V]{
 		config: &timeBasedStatefulServiceConfig{
 			interval: 10 * time.Minute,
 		},
-		count: 1,
-		p:     p,
-		v:     v,
-		pool:  pool,
-		ctx:   ctx,
+		count:  0,
+		p:      p,
+		v:      v,
+		pool:   pool,
+		ctx:    ctx,
+		cancel: cancel,
+		event:  make(chan int32, 10),
 	}
 	for _, opt := range opts {
 		opt(timeBasedStatefulService.config)
 	}
 
-	timeBasedStatefulService.expire = time.Now().Add(timeBasedStatefulService.config.interval)
+	timeBasedStatefulService.add()
 
-	newRefreshExpiryTimeGoroutine(ctx, timeBasedStatefulService, timeBasedStatefulService.config.interval/2).Start()
+	newRefreshExpiryTimeGoroutine(ctx, timeBasedStatefulService).Start()
 
 	return timeBasedStatefulService
 }
